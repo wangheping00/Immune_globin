@@ -1,0 +1,580 @@
+---
+title: "RNA-seq, ATAC-seq, CUTTag analysis of IRF1OE erythroblasts"
+author: "heping"
+date: "2026-03-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# I. load packages
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(clusterProfiler)
+library(ggpubr)
+library(readxl)
+library(ggrepel)
+library(scales)
+library(DESeq2)
+library(stringr)
+library(RColorBrewer)
+library(paletteer)
+library(ChIPseeker)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(eulerr)
+```
+
+
+# RNA-seq data analysis
+
+## DEGs analysis
+```{r}
+counts <- read.delim("./IRF1OE.raw.count.matrix.txt")
+
+samples <- data.frame(sample = colnames(counts), 
+                      condition = c(rep("IRF1OE",3),rep('Control',3)),
+                      replicate = c(rep(1:3, 2)))
+rownames(samples)=samples$sample
+samples$condition <- factor(samples$condition, levels = c("Control", "IRF1OE"))
+
+
+dds <- DESeqDataSetFromMatrix(countData = round(counts), 
+                              colData = samples, design = ~ replicate+condition)
+dds <- DESeq(dds)
+res <- results(dds, contrast = c("condition", "IRF1OE", "Control"))
+resultsNames(dds)
+resLFC <- lfcShrink(dds, coef="condition_IRF1OE_vs_Control", type="apeglm")
+
+res_all <- as.data.frame(resLFC) %>% 
+  filter(log2FoldChange != 'NA') %>%
+  filter(padj != 'NA')
+res_all$type <- ifelse(res_all$padj< 0.05,
+                       ifelse(abs(res_all$log2FoldChange) > 0.25,
+                            ifelse(res_all$log2FoldChange < (-0.25),'down','up'),'noSig'),'noSig')
+write.csv(res_all, "./result/diff.rna.csv")
+```
+
+## Figure S6A: PCA plot
+```{r}
+data <- assay(vsd)
+data <- limma::removeBatchEffect(data, vsd$replicate)
+
+dat <- data
+dat <- na.omit(dat)
+dat <- as.data.frame(t(dat))
+pca.res <- prcomp(dat)
+
+con_color=c(Control = "#71bbc0", IRF1OE = "#d28073")
+
+percentage<-round(pca.res$sdev / sum(pca.res$sdev) * 100,2)
+percentage<-paste(colnames(pca.res),"(", paste(as.character(percentage), "%", ")", sep=""))
+as.data.frame(pca.res$x) %>% rownames_to_column(var = "sample") %>%
+  mutate(Group=c(rep("Control",3),rep("IRF1OE",3))) %>%
+  ggplot(aes(x=PC1,y=PC2,color=Group,label=sample)) + 
+  scale_color_manual(values = con_color)+
+  geom_point(size=3)+
+  geom_text_repel()+
+  xlab(paste0("PC1",percentage[1])) + ylab(paste0("PC2",percentage[2])) +
+  theme_bw()
+```
+
+## Figure S6D: volcano plot
+```{r}
+keyvals <- ifelse(
+  res_all$log2FoldChange < (-0.25) & res_all$padj<0.05, '#84B1ED',
+  ifelse(res_all$log2FoldChange > 0.25 & res_all$padj<0.05, '#EC7357',
+         '#a3a1a1'))
+keyvals[is.na(keyvals)] <- '#a3a1a1'
+names(keyvals)[keyvals == '#EC7357'] <- 'UP'
+names(keyvals)[keyvals == '#a3a1a1'] <- 'Not Sig'
+names(keyvals)[keyvals == '#84B1ED'] <- 'DOWN'
+
+table(keyvals)
+
+up <- res_all %>% filter(res_all$type=="up") %>% pull(X)
+down <- res_all %>% filter(res_all$type=="down") %>% pull(X)
+
+EnhancedVolcano(res_all, lab = res_all$X,
+                x = 'log2FoldChange',y = 'padj',
+                title = "IRF1 OE vs Control", subtitle = "UP: 2042  DOWN: 1878", caption = '',
+                selectLab = "none",
+                
+                xlab = bquote(~log[2]~ 'fold change'),
+                ylab=bquote(~-log[10]~'adjusted p-value'),
+                col=c("#a3a1a1","#84B1ED","#60c5ba","#EC7357"),
+                gridlines.major = FALSE,gridlines.minor = FALSE,
+                colCustom = keyvals, axisLabSize = 13,
+                pCutoff = 0.05, FCcutoff = 0.25,
+                pointSize = 1,labSize = 3,
+                labCol = 'black', labFace = 'italic',
+                colAlpha = .8, legendPosition = 'none')
+```
+
+# ATAC-seq data analysis
+
+## preprocess
+```{bash}
+for i in `ls $dataPath`;
+do
+	#QC
+	fastqc -o $fastqcPath -t 10 $dataPath/${i}/*.fq.gz
+
+	#alignment
+	bowtie2 -p 12 --very-sensitive -k 10 -X 1000 -x $BT2_ref -1 $dataPath/${i}/${i}_1.clean.fq.gz -2 $dataPath/${i}/${i}_2.clean.fq.gz \
+	|samtools sort -@ 12 -O bam -o - > $alignmentPath/${i}.sorted.bam
+	samtools flagstat $alignmentPath/${i}.sorted.bam > $alignmentPath/${i}.sorted.stat 
+
+	#remove PCR duplicate
+    sambamba markdup --overflow-list-size 600000 --tmpdir='./' -r $alignmentPath/${i}.sorted.bam $alignmentPath/${i}.rmdup.bam 
+    samtools index $alignmentPath/${i}.rmdup.bam
+    #remove mito
+    mtReads=$(samtools idxstats $alignmentPath/${i}.rmdup.bam | grep 'chrM' | cut -f 3)
+    totalReads=$(samtools idxstats $alignmentPath/${i}.rmdup.bam | awk '{SUM += $3} END {print SUM}')
+    echo '==> mtDNA Content:' $(bc <<< "scale=2;100*$mtReads/$totalReads")'%'
+
+    #
+    samtools flagstat $alignmentPath/${i}.rmdup.bam > $alignmentPath/${i}.rmdup.stat
+    samtools view -h -f 2 -q 30 $alignmentPath/${i}.rmdup.bam |grep -v chrM |samtools sort -O bam -@ 5 -o - > $alignmentPath/${i}.last.bam
+    samtools index $alignmentPath/${i}.last.bam
+    samtools flagstat $alignmentPath/${i}.last.bam > $alignmentPath/${i}.last.stat
+
+    #sort -n
+    samtools sort -n -@ 10 -o $alignmentPath/${i}.filtered.sorted.bam $alignmentPath/${i}.last.bam
+	#then Peak calling
+	Genrich  -j -y -r -v -e chrM -t $alignmentPath/${i}.filtered.sorted.bam -o $narrowpeakPath/${i}.narrowPeak
+
+	#convert to bed
+	bedtools bamtobed -i $alignmentPath/${i}.last.bam > $alignmentPath/${i}.bed
+
+done
+```
+
+## peak calling of differential accessible peaks
+```{bash}
+Genrich  -j -y -r -a 500 -v -t $alignmentPath/ATAC_OE.filtered.sorted.bam -c $alignmentPath/ATAC_VL.filtered.sorted.bam \
+-o $narrowpeakPath/I1_VL_a500.narrowPeak
+
+Genrich  -j -y -r -a 500 -v -t $alignmentPath/ATAC_VL.filtered.sorted.bam -c $alignmentPath/ATAC_OE.filtered.sorted.bam \
+-o $narrowpeakPath/VL_I1_a500.narrowPeak
+
+awk '{print $1"\t"$2"\t"$3"\t"$4"\t"$5"\t"$6}' I1_VL_a500.narrowPeak > I1_VL.bed
+awk '{print $1"\t"$2"\t"$3"\t"$4"\t"$5"\t"$6}' VL_I1_a500.narrowPeak > VL_I1.bed
+
+```
+
+## Figure 4A: genome-wide ATAC signal
+```{bash}
+samtools merge $alignmentPath/ATAC_VL.merged.bam \
+$alignmentPath/ATAC_VL1.last.bam \
+$alignmentPath/ATAC_VL2.last.bam \
+$alignmentPath/ATAC_VL3.last.bam \
+samtools merge $alignmentPath/ATAC_OE.merged.bam \
+$alignmentPath/ATAC_OE1.last.bam \
+$alignmentPath/ATAC_OE2.last.bam \
+$alignmentPath/ATAC_OE3.last.bam \
+#then index
+samtools index $alignmentPath/ATAC_VL.merged.bam
+samtools index $alignmentPath/ATAC_OE.merged.bam
+
+bamCoverage -b $alignmentPath/ATAC_VL.merged.bam -o $resultPath/ATAC_VL.bigwig --normalizeUsing RPKM -p 30
+bamCoverage -b $alignmentPath/ATAC_OE.merged.bam -o $resultPath/ATAC_OE.bigwig --normalizeUsing RPKM -p 30
+
+computeMatrix reference-point --referencePoint TSS -b 2000 -a 2000 \
+       -R $tssPath/hg38.tss.bed \
+       -S $resultPath/ATAC_VL.bigwig $resultPath/ATAC_OE.bigwig \
+       --skipZeros \
+       --blackListFileName $blacklistPath/hg38-blacklist.v2.bed \
+       -o $resultPath/matrix_new.mat.gz --outFileSortedRegions $resultPath/regions_genes_new.bed
+
+plotProfile -m $resultPath/matrix_new.mat.gz \
+--perGroup \
+-out $figurePath/tss_m.pdf
+```
+
+## Figure 4B: peak annotation
+```{r}
+filename <- list.files("./result/diffpeak/")
+fileList <- file.path(paste0("./result/diffpeak/",filename))
+names(fileList) <- filename
+
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+
+peak=list()
+
+for(i in fileList){
+peak[[i]] <- readPeakFile(i)
+}
+names(peak)=str_remove(filename,"_a500.narrowPeak")
+
+options(ChIPseeker.ignore_1st_exon = T)
+options(ChIPseeker.ignore_1st_intron = T)
+options(ChIPseeker.ignore_downstream = T)
+peakAnnoList <- lapply(peak, annotatePeak, TxDb=txdb,
+                       tssRegion=c(-3000, 3000), verbose=FALSE)
+
+up <- peakAnnoList$I1_VL@annoStat
+up$type <- c(rep("up",length(up$Feature)))
+down <- peakAnnoList$VL_I1@annoStat
+down$type <- c(rep("down",length(down$Feature)))
+data <- rbind(up,down)
+data$type <- factor(data$type, levels = c("up","down"))
+data$Feature <- factor(data$Feature, levels = data$Feature[1:8])
+
+ggplot(data, aes(x = type, y = Frequency, fill = Feature)) +
+  geom_col(position = "stack", width = 0.7) +  
+  scale_fill_brewer(palette = "Dark2") +
+  ylab("Frequency (%)") +
+  xlab("")+
+  theme_pubr() +
+  theme(legend.position = "right" )
+```
+
+## Figure S6B: PCA plot
+```{r}
+count <- read.csv("./result/atac.count.csv") %>% 
+  dplyr::select(-1) %>% column_to_rownames(var="gene") %>%
+  dplyr::select(-X)
+count <- dplyr::select(count, "VL1", "VL2", "VL3", "OE1", "OE2", "OE3")
+
+group=c(rep("VL",3),rep("OE",3))
+batch <- c(1,1,2,1,1,2)
+coldata <- data.frame(group=group, batch=batch)
+rownames(coldata) <- colnames(count)
+coldata$group <- factor(coldata$group,
+                        levels=c("VL", "OE"))
+coldata$batch <- factor(coldata$batch)
+
+dds <- DESeqDataSetFromMatrix(countData = count, colData = coldata,design = ~ batch+group)
+dds <- DESeq(dds)
+resultsNames(dds) 
+res <- lfcShrink(dds, coef="group_OE_vs_VL", type="apeglm")
+vsd <- vst(dds, blind=FALSE)
+
+data <- assay(vsd)
+count2 <- removeBatchEffect(data, batch = coldata$batch)
+dat <- count2
+dat <- na.omit(dat)
+dat <- as.data.frame(t(dat))
+pca.res <- prcomp(dat)
+
+percentage<-round(pca.res$sdev / sum(pca.res$sdev) * 100,2)
+percentage<-paste(colnames(pca.res),"(", paste(as.character(percentage), "%", ")", sep=""))
+as.data.frame(pca.res$x) %>% rownames_to_column(var = "sample") %>%
+  mutate(Group=c(rep("VL",3),rep("OE",3))) %>%
+  ggplot(aes(x=PC1,y=PC2,color=Group,label=sample)) + 
+  geom_point(size=3)+
+  geom_text_repel()+
+  xlab(paste0("PC1",percentage[1])) + ylab(paste0("PC2",percentage[2])) +
+  theme_bw()
+```
+
+## Figure S6C: Fragment length
+```{bash}
+#get fragment length
+for i in `ls $dataPath`;
+do
+samtools view $alignmentPath/${i}.last.bam | \
+awk -F'\t' 'function abs(x){return ((x < 0.0) ? -x : x)} {print $1"\t"abs($9)}' | \
+sort | uniq | cut -f2 > ${i}.length.txt
+done
+```
+
+```{r}
+filesname <- list.files("./fragment/")
+path <- file.path(paste0("./fragment/",filesname))
+names(path) <- filesname
+
+fragment=list()
+for (i in filesname){
+  fragment[[i]] <- read.delim(path[i], header = F)
+}
+
+lapply(fragment, function(x){
+  x <- tbl_df(x) %>% filter(V1!=0)
+  length_cutoff <- 1200
+  fragment <- x$V1[x$V1 <= length_cutoff]
+})->fragment.filt
+
+fragment <- do.call(cbind,fragment.filt)
+colnames(fragment)=str_remove(colnames(fragment), ".length.txt")
+
+fragment %>% as.data.frame() %>% select(-X) %>%
+  pivot_longer(cols = 1:6, names_to = "sample", values_to = "frag") %>%
+  ggdensity(x="frag", color = "sample")+
+  xlab("Fragment Length (bp)")+
+  ylab("Density")
+```
+
+## Figure 4D: Integrated with RNA-seq data
+```{r}
+# ATAC-seq differential accessible peaks (annotated to genes)
+res <- as.data.frame(res) %>% 
+  filter(log2FoldChange != 'NA') %>% 
+  filter(padj != 'NA')
+table(res$padj<0.05)
+res$type <- ifelse(res$padj < 0.05,
+                       ifelse(abs(res$log2FoldChange) > 0,
+                              ifelse(res$log2FoldChange < 0,'down','up'),'noSig'),'noSig')
+write.csv(res, "./result/diff.atac.csv")
+
+
+# overlap with RNA-seq DEGs
+atac.up <- read.csv("./result/diff.atac.csv") %>% filter(type == "up") %>% pull(X)
+rna.up <- read.csv("./result/diff.rna.csv") %>% filter(type == "up") %>% pull(X)
+up.overlap <- intersect(atac.up, rna.up) #202 genes
+
+atac.down <- read.csv("./result/diff.atac.csv") %>% filter(type == "down") %>% pull(X)
+rna.down <- read.csv("./result/diff.rna.csv") %>% filter(type == "down") %>% pull(X)
+down.overlap <- intersect(atac.down, rna.down) #22 genes
+
+# venn plot
+venn_data <- c(
+  A = 1840,   
+  B = 1217,   
+  "A&B" = 202  
+)
+venn_fit <- euler(venn_data)
+
+plot(venn_fit,
+     main = "",
+     quantities = list(type = c("counts"), fontsize = 10), 
+     fills = list(fill = c("#FFA1A1", "#4890bd"), alpha = 0.7), 
+     labels = list(col = "black", font = 2, cex = 1.2), 
+     edges = list(col = "transparent", 
+                  lwd = 0))
+```
+
+```{r}
+# pathway enrichment
+david <- read.delim("./result/david.rna.atac.up.gene.txt")
+
+up.BP <- david %>% dplyr::filter(Category == "GOTERM_BP_DIRECT") %>% filter(PValue<0.05)
+up.MF <- david %>% filter(Category == "GOTERM_MF_DIRECT") %>% filter(PValue<0.05)
+up.CC <- david %>% filter(Category == "GOTERM_CC_DIRECT") %>% filter(PValue<0.05)
+up.res <- rbind(up.BP, up.MF, up.CC)
+up.res$GeneRatio <- up.res$Count/202
+up.res$Term <- str_split(up.res$Term, "~", simplify = T)[,2]
+up.res$Term <- str_to_title(up.res$Term)
+up.res$Category <- str_remove(up.res$Category, "_DIRECT")
+up.res$Category <- str_remove(up.res$Category, "TERM")
+up.res <- up.res %>% dplyr::select(Term, PValue, Count, GeneRatio) %>%
+  group_by(up.res$Category) %>%
+  arrange(PValue) %>% 
+  slice_head(n=8) %>%
+  ungroup() 
+colnames(up.res)[5]="Category"
+
+up.res$log10p <- -log10(up.res$PValue)
+
+up.res <- up.res %>%
+  group_by(Category) %>%
+  mutate(Term = forcats::fct_reorder(Term, log10p, .desc = FALSE)) %>% 
+  ungroup()
+
+ggplot(up.res, aes(x = log10p, y = Term, size = Count, color = Category)) +
+  geom_point(alpha = 0.7) + 
+  facet_grid(Category ~ ., scales = "free_y", space = "free_y") + 
+  scale_size_continuous(range = c(3, 8), name = "Gene Count") + 
+  scale_color_manual(values = c("GO_BP" = "#E69F00", 
+                                "GO_CC" = "#56B4E9", 
+                                "GO_MF" = "#009E73")) +
+  labs(x = "-log10(P-value)", y = "") +
+  theme_classic()
+```
+
+
+# CUT&Tag data analysis
+
+## preprocess
+```{bash}
+for i in ${data[@]};
+do
+# remove adaptor
+java -jar /data/ldp02/tools/Trimmomatic-0.38/trimmomatic-0.38.jar PE \
+-threads 12 -phred33 $rawPath/${i}.R1.raw.fastq.gz $rawPath/${i}.R2.raw.fastq.gz \
+-baseout $dataPath/${i}.fq.gz \
+ILLUMINACLIP:/data/ldp02/tools/Trimmomatic-0.38/adapters/NexteraPE-PE.fa:2:30:10:8:true \
+
+# fastQC
+/data/software/FastQC/fastqc -o $qcPath -t 12 $dataPath/${i}_1P.fq.gz
+/data/software/FastQC/fastqc -o $qcPath -t 12 $dataPath/${i}_2P.fq.gz
+
+# alignment
+/data/ldp/software/bowtie2-2.3.4.2-linux-x86_64/bowtie2 -p 8 \
+--local --very-sensitive \
+--phred33 -I 10 -X 1000 \
+--dovetail --no-contain --no-overlap \
+-x $BT2_ref -1 $dataPath/${i}_1P.fq.gz -2 $dataPath/${i}_2P.fq.gz \
+2> $alignmentPath/${i}_bowtie2.txt \
+| /data/software/samtools-1.17.0/bin/samtools view -@ 4 -bS - \
+| /data/software/samtools-1.17.0/bin/samtools sort -@ 4 -o $alignmentPath/${i}.sorted.bam
+
+/data/software/samtools-1.17.0/bin/samtools flagstat -@ 8 $alignmentPath/${i}.sorted.bam > $alignmentPath/${i}.flagstat.txt
+/data/software/samtools-1.17.0/bin/samtools index -@ 8 $alignmentPath/${i}.sorted.bam
+
+# spike in and calculate scaling factor
+/data/ldp/software/bowtie2-2.3.4.2-linux-x86_64/bowtie2 -x /data/ldp02/wangheping/cuttag_test/Ecoli/E.coli.ref \
+--local --very-sensitive \
+--phred33 -I 10 -X 1000 \
+--dovetail --no-contain --no-overlap \
+-1 $dataPath/${i}_1P.fq.gz -2 $dataPath/${i}_2P.fq.gz \
+2> $alignmentPath/${i}_bowtie2.spikein.txt \
+| /data/software/samtools-1.17.0/bin/samtools view -@ 8 -bS - \
+| /data/software/samtools-1.17.0/bin/samtools sort -@ 8 -o $alignmentPath/${i}.spikein.sorted.bam
+
+/data/software/samtools-1.17.0/bin/samtools flagstat -@ 8 $alignmentPath/${i}.spikein.sorted.bam > $alignmentPath/${i}.spikein.flagstat.txt
+
+# Remove PCR duplicates
+gatk MarkDuplicates -I $alignmentPath/${i}.sorted.bam -O $deduplicates/${i}.sorted.rmDup.bam \
+--REMOVE_DUPLICATES true --METRICS_FILE $deduplicates/${i}_picard.rmDup.txt
+
+/home/ldp507/software/samtools-1.17/bin/samtools view -b -F 0x04 $deduplicates/${i}.sorted.rmDup.bam > $alignmentPath/${i}.mapped.rmDup.bam
+/home/ldp507/software/samtools-1.17/bin/samtools index $alignmentPath/${i}.mapped.rmDup.bam
+
+done
+```
+
+## Figure S6E: PCA plot of CUT&Tag data
+```{bash}
+multiBamSummary bins -p 20 \
+--bamfiles $alignmentPath/H3K9ac.VL1.sorted.bam $alignmentPath/H3K9ac.VL2.sorted.bam \
+$alignmentPath/H3K9ac.OE1.sorted.bam $alignmentPath/H3K9ac.OE2.sorted.bam \
+$alignmentPath/H3K27ac.VL1.sorted.bam $alignmentPath/H3K27ac.VL2.sorted.bam \
+$alignmentPath/H3K27ac.OE1.sorted.bam $alignmentPath/H3K27ac.OE2.sorted.bam \
+--labels H3K9ac.VL1 H3K9ac.VL2 H3K9ac.OE1 H3K9ac.OE2 H3K27ac.VL1 H3K27ac.VL2 H3K27ac.OE1 H3K27ac.OE2 \
+-out $bwPath/readCounts.npz --outRawCounts $bwPath/readCounts.tab
+
+/data/software/bedtools2.27/bedtools window -a $tssPath/hg38.tss.bed -b $bwPath/readCounts.tab -w 5000 > $bwPath/H3Kac.count.gene
+```
+
+```{r}
+counts <- read.csv("./result/H3Kac.count.gene.csv") %>% 
+  column_to_rownames(var = "X")
+
+samples <- data.frame(sample = colnames(counts), 
+                      condition = c(rep("H3K9ac.V",2),rep('H3K9ac.I',2),
+                                    rep("H3K27ac.V",2),rep('H3K27ac.I',2)),
+                      replicate = c(rep(1:2, 2)))
+rownames(samples)=samples$sample
+samples$condition <- factor(samples$condition, levels = c("H3K9ac.V","H3K9ac.I",
+                                                          "H3K27ac.V",'H3K27ac.I'))
+
+dds <- DESeqDataSetFromMatrix(countData = round(counts), 
+                              colData = samples, design = ~ replicate+condition)
+dds <- DESeq(dds)
+res <- results(dds, contrast = c("condition", "IRF1OE", "Control"))
+resultsNames(dds)
+resLFC <- lfcShrink(dds, coef="condition_IRF1OE_vs_Control", type="apeglm")
+
+res_all <- as.data.frame(resLFC) %>% 
+  filter(log2FoldChange != 'NA') %>%
+  filter(padj != 'NA')
+res_all$type <- ifelse(res_all$padj< 0.05,
+                       ifelse(abs(res_all$log2FoldChange) > 0.25,
+                            ifelse(res_all$log2FoldChange < (-0.25),'down','up'),'noSig'),'noSig')
+write.csv(res_all, "./result/diff.H3Kac.csv")
+
+vsd <- vst(dds)
+write.csv(assay(vsd), "./result/H3Kac.vst.norm.csv")
+
+pcaData <- plotPCA(vsd, intgroup=c("condition"), returnData=TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+
+ggplot(pcaData, aes(PC1, PC2, color=condition, label=rownames(pcaData))) +
+  geom_point(size=3)+
+  geom_text_repel()+
+  theme_bw()+
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed()
+```
+
+## Figure 4E: genome-wide signal of ATAC, H3K9ac and H3K27ac
+```{bash}
+/data/software/samtools-1.17.0/bin/samtools merge $alignmentPath/VL.H3K9ac.merged.bam \
+$alignmentPath/H3K9ac.VL1.mapped.rmDup.bam \
+$alignmentPath/H3K9ac.VL2.mapped.rmDup.bam
+/data/software/samtools-1.17.0/bin/samtools merge $alignmentPath/OE.H3K9ac.merged.bam \
+$alignmentPath/H3K9ac.OE1.mapped.rmDup.bam \
+$alignmentPath/H3K9ac.OE2.mapped.rmDup.bam
+#then index
+/data/software/samtools-1.17.0/bin/samtools index $alignmentPath/VL.H3K9ac.merged.bam
+/data/software/samtools-1.17.0/bin/samtools index $alignmentPath/OE.H3K9ac.merged.bam
+
+/data/software/samtools-1.17.0/bin/samtools merge $alignmentPath/VL.H3K27ac.merged.bam \
+$alignmentPath/H3K27ac.VL1.mapped.rmDup.bam \
+$alignmentPath/H3K27ac.VL2.mapped.rmDup.bam
+/data/software/samtools-1.17.0/bin/samtools merge $alignmentPath/OE.H3K27ac.merged.bam \
+$alignmentPath/H3K27ac.OE1.mapped.rmDup.bam \
+$alignmentPath/H3K27ac.OE2.mapped.rmDup.bam
+#then index
+/data/software/samtools-1.17.0/bin/samtools index $alignmentPath/VL.H3K27ac.merged.bam
+/data/software/samtools-1.17.0/bin/samtools index $alignmentPath/OE.H3K27ac.merged.bam
+
+bamCoverage -b $alignmentPath/VL.H3K9ac.merged.bam --normalizeUsing RPKM -o $bwPath/VL.H3K9ac.rpkm.bw
+bamCoverage -b $alignmentPath/OE.H3K9ac.merged.bam --normalizeUsing RPKM -o $bwPath/OE.H3K9ac.rpkm.bw
+bamCoverage -b $alignmentPath/VL.H3K27ac.merged.bam --normalizeUsing RPKM -o $bwPath/VL.H3K27ac.rpkm.bw
+bamCoverage -b $alignmentPath/OE.H3K27ac.merged.bam --normalizeUsing RPKM -o $bwPath/OE.H3K27ac.rpkm.bw
+
+computeMatrix reference-point --referencePoint TSS -b 2000 -a 2000 \
+       -R $bwPath/I1_VL.bed \
+       -S $resultPath/ATAC_VL.bigwig $resultPath/ATAC_OE.bigwig $bwPath/VL.H3K9ac.rpkm.bw $bwPath/OE.H3K9ac.rpkm.bw $bwPath/VL.H3K27ac.rpkm.bw $bwPath/OE.H3K27ac.rpkm.bw \
+       --skipZeros --missingDataAsZero \
+       --blackListFileName $blacklistPath/hg38-blacklist.v2.bed \
+       -o $bwPath/tss.m.matrix.mat.gz --outFileSortedRegions $bwPath/tss.regions_genes.bed
+
+plotHeatmap -m $bwPath/tss.m.matrix.mat.gz \
+--colorMap Blues Blues Oranges Oranges Greens Greens \
+-out $figurePath/tss.atac.up.pdf
+```
+
+## Figure 4F: H3K9ac and H3K27ac signal of accessible regions in control and IRF1-OE cells
+```{r}
+signal <- read.csv("./result/H3Kac.vst.norm.csv")
+signal <- signal[!duplicated(signal$X), ]
+rownames(signal) <- signal$X
+signal <- signal[, -1]
+signal <- signal[, 1:8]
+
+atac.up <- read.csv("./result/diff.atac.csv") %>% filter(type == "up") %>% pull(X)
+atac.down <- read.csv("./result/diff.atac.csv") %>% filter(type == "down") %>% pull(X)
+
+signal.atac <- filter(signal, rownames(signal) %in% atac.up)
+signal.atac <- filter(signal, rownames(signal) %in% atac.down)
+```
+
+```{r}
+#H3K9ac
+df <- signal.atac[1:4] %>% 
+  pivot_longer(cols=1:4, names_to = "sample", values_to = "expr") %>%
+  mutate(group=substr(sample, 8, 8))
+df$group <- factor(df$group, levels = c("V", "I"))
+  
+ggplot(df, aes(x = group, y = expr, fill = group)) +
+  geom_violin(trim = FALSE) + 
+  geom_boxplot(width = 0.2, fill = "white") +
+  scale_fill_manual(values = c("V" = "#E5580A", "I" = "#E5580A"))+
+  stat_compare_means(method = "wilcox.test") +
+  xlab("")+ylab("H3K9ac signal")+
+  theme_classic()
+```
+
+```{r}
+#H3K27ac
+df <- signal.atac[5:8] %>% 
+  pivot_longer(cols=1:4, names_to = "sample", values_to = "expr") %>%
+  mutate(group=substr(sample, 9, 9))
+df$group <- factor(df$group, levels = c("V", "I"))
+  
+ggplot(df, aes(x = group, y = expr, fill = group)) +
+  geom_violin(trim = FALSE) + 
+  geom_boxplot(width = 0.2, fill = "white") +
+  scale_fill_manual(values = c("V" = "#349d53", "I" = "#349d53"))+
+  stat_compare_means(method = "wilcox.test") +
+  xlab("")+ylab("H3K27ac signal")+
+  theme_classic()
+```
+
